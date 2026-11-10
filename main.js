@@ -169,51 +169,45 @@ function applyJsonPatch(obj, ops) {
 
 function applyNotification(method, params) {
   const sessionId = params && params.sessionId;
+  if (!sessionId) {
+    broadcast('vibe:event', { method, params });
+    return;
+  }
+  const st = ensureState(sessionId);
   if (typeof params.eventId === 'number') {
     globalLastEventId = Math.max(globalLastEventId, params.eventId);
-    if (sessionId) {
-      const st = ensureState(sessionId);
-      st.lastEventId = Math.max(st.lastEventId, params.eventId);
-    }
+    st.lastEventId = Math.max(st.lastEventId, params.eventId);
   }
   switch (method) {
     case 'session/snapshot': {
-      const st = params.state || {};
-      const id = st.session && st.session.id;
+      const snap = params.state || {};
+      const id = snap.session && snap.session.id;
       if (!id) break;
-      const s = ensureState(id);
-      s.session = st.session;
+      const s = id === sessionId ? st : ensureState(id);
+      s.session = snap.session;
       s.entries = new Map();
       s.order = [];
-      for (const e of st.history || []) {
+      for (const e of snap.history || []) {
         s.entries.set(e.id, e);
         s.order.push(e.id);
       }
-      s.turns = new Map((st.turns || []).map((t) => [t.id, t]));
-      s.activeCallbacks = new Map((st.activeCallbacks || []).map((c) => [c.callbackId, c]));
-      s.turnQueue = st.turnQueue || null;
-      if (typeof st.eventId === 'number') s.lastEventId = st.eventId;
+      s.turns = new Map((snap.turns || []).map((t) => [t.id, t]));
+      s.activeCallbacks = new Map((snap.activeCallbacks || []).map((c) => [c.callbackId, c]));
+      s.turnQueue = snap.turnQueue || null;
+      if (typeof snap.eventId === 'number') {
+        s.lastEventId = snap.eventId;
+        globalLastEventId = Math.max(globalLastEventId, snap.eventId);
+      }
       pushState(id);
       break;
     }
-    case 'history/entryAdded': {
-      if (!sessionId || !params.entry) break;
-      const s = ensureState(sessionId);
-      if (!s.entries.has(params.entry.id)) {
-        s.entries.set(params.entry.id, params.entry);
-        s.order.push(params.entry.id);
-      } else {
-        s.entries.set(params.entry.id, params.entry);
-      }
-      pushState(sessionId);
-      break;
-    }
+    case 'history/entryAdded':
     case 'history/entryUpdated': {
-      if (!sessionId || !params.entry) break;
-      const s = ensureState(sessionId);
-      s.entries.set(params.entry.id, params.entry);
-      if (!s.order.includes(params.entry.id)) s.order.push(params.entry.id);
-      pushState(sessionId);
+      if (!params.entry) break;
+      const added = !st.entries.has(params.entry.id);
+      if (added) st.order.push(params.entry.id);
+      st.entries.set(params.entry.id, params.entry);
+      broadcast('vibe:entry', { sessionId, entry: params.entry, added });
       break;
     }
     case 'session/updated': {
@@ -224,7 +218,7 @@ function applyNotification(method, params) {
       } else if (s.session && params.patch) {
         applyJsonPatch(s.session, params.patch);
       }
-      pushState(sessionId);
+      if (s.session) broadcast('vibe:session', { sessionId, session: s.session });
       break;
     }
     case 'turn/started':
@@ -233,9 +227,12 @@ function applyNotification(method, params) {
       const s = ensureState(sessionId);
       s.turns.set(params.turn.id, params.turn);
       if (s.session && s.session.status && s.session.status.type === 'running' && params.turn.status !== 'in_progress') {
-        s.session = { ...s.session, status: { type: 'idle' } };
+        applyJsonPatch(s.session, [
+          { op: 'remove', path: '/status/activeTurnId' },
+          { op: 'replace', path: '/status/type', value: 'idle' },
+        ]);
+        broadcast('vibe:session', { sessionId, session: s.session });
       }
-      pushState(sessionId);
       if (method === 'turn/completed' && params.turn.status === 'completed') {
         maybeNotifyTurnCompleted(sessionId, params.turn);
         refreshAccountSoon();
@@ -245,52 +242,41 @@ function applyNotification(method, params) {
     case 'turn/queueUpdated': {
       if (!sessionId) break;
       ensureState(sessionId).turnQueue = params.queue || null;
-      pushState(sessionId);
+      broadcast('vibe:queue', { sessionId, queue: params.queue || null });
       break;
     }
     case 'session/statsUpdated': {
       if (!sessionId) break;
       ensureState(sessionId).stats = params.stats || null;
-      pushState(sessionId);
+      broadcast('vibe:stats', { sessionId, stats: params.stats || null });
       break;
     }
-    case 'session/childSessionUpdated':
-    case 'artifacts/created':
-    case 'artifacts/updated':
     case 'session/compacted':
-    case 'session/contextCleared':
-    case 'runtime/updated':
-    case 'warning':
-    case 'error':
-    case 'turn/retrying':
-    case 'session/lease/updated':
-    case 'session/lease/ended':
-    case 'mcp_catalog/authRequired':
-    case 'connector_catalog/authRequired':
-      break; // forwarded raw below
+    case 'session/contextCleared': {
+      // conversation was rewritten server-side: resync from the session itself
+      if (sessionId) resyncSession(sessionId);
+      break;
+    }
     default:
       break;
   }
   broadcast('vibe:event', { method, params });
 }
 
-let eventPollTimer = null;
+async function resyncSession(sessionId) {
+  try {
+    const srv = await ensureServer();
+    await srv.request('session/read', { sessionId, history: { limit: 500, direction: 'backward' } });
+  } catch (_) { /* best-effort */ }
+}
+
+let accountPollTimer = null;
 let serverReady = false;
 
-function startEventPoll() {
-  if (eventPollTimer) return;
-  // Poll the server event log so sessions that are not currently attached
-  // to this connection still update (titles, previews, background turns).
-  eventPollTimer = setInterval(async () => {
-    try {
-      const batch = await server.request('events/read', { afterEventId: globalLastEventId, batchSize: 1000 });
-      for (const ev of (batch && batch.events) || []) {
-        if (ev && ev.method) applyNotification(ev.method, ev.params || {});
-      }
-    } catch (_) { /* server may be busy/restarting */ }
-  }, 4000);
-  // usage/billing gauge refresh every 60s
-  setInterval(() => { refreshAccount(); }, 60000);
+function startAccountPoll() {
+  if (accountPollTimer) return;
+  // usage/billing gauge refresh every 60s (also refreshed after each turn)
+  accountPollTimer = setInterval(() => { refreshAccount(); }, 60000);
 }
 
 async function ensureServer() {
@@ -308,7 +294,7 @@ async function ensureServer() {
         if (cb) {
           const st = ensureState(cb.sessionId);
           st.activeCallbacks.set(cb.callbackId, cb);
-          pushState(cb.sessionId);
+          broadcast('vibe:callbacks', { sessionId: cb.sessionId, activeCallbacks: Array.from(st.activeCallbacks.values()) });
         }
         server.respond(msg.id, { callbackId: cb ? cb.callbackId : null, accepted: true });
         broadcast('vibe:callback', msg.params);
@@ -318,13 +304,13 @@ async function ensureServer() {
     });
     server.on('exit', () => {
       serverReady = false;
-      if (eventPollTimer) { clearInterval(eventPollTimer); eventPollTimer = null; }
+      if (accountPollTimer) { clearInterval(accountPollTimer); accountPollTimer = null; }
       broadcast('vibe:serverExit', {});
     });
     serverStarting = (async () => {
       const result = await server.handshake();
       serverReady = true;
-      startEventPoll();
+      startAccountPoll();
       return result;
     })().catch((e) => { serverStarting = null; throw e; });
   }
@@ -453,10 +439,10 @@ function registerIpc() {
     try {
       return await srv.request('turn/start', { sessionId: args.sessionId, message: blocks });
     } catch (e) {
-      // busy -> enqueue instead
+      // busy -> add to the session's turn queue instead (TurnUserInputEntry: role/entryId/content only)
       const res = await srv.request('session/turn/enqueue', {
         sessionId: args.sessionId,
-        entries: [{ type: 'message', role: 'user', content: blocks }],
+        entries: [{ role: 'user', content: blocks }],
       });
       return { queued: true, result: res, originalError: String(e && e.message || e) };
     }
@@ -476,7 +462,7 @@ function registerIpc() {
     const st = getState(args.sessionId);
     if (st) {
       st.activeCallbacks.delete(args.callbackId);
-      pushState(args.sessionId);
+      broadcast('vibe:callbacks', { sessionId: args.sessionId, activeCallbacks: Array.from(st.activeCallbacks.values()) });
     }
     return res;
   });
@@ -495,7 +481,7 @@ function registerIpc() {
 
   ipcMain.handle('session:rename', async (_e, args) => {
     const srv = await ensureServer();
-    return srv.request('session/title/update', { sessionId: args.sessionId, title: args.title });
+    return srv.request('session/rename', { sessionId: args.sessionId, title: args.title });
   });
 
   ipcMain.handle('session:agent:update', async (_e, args) => {
@@ -564,31 +550,38 @@ function registerIpc() {
     const query = (args.query || '').toLowerCase();
     const results = [];
     const skip = new Set(['node_modules', '.git', '.hg', '.svn', 'dist', 'build', '.next', '.cache', '__pycache__', '.venv', 'venv']);
-    let count = 0;
-    function walk(dir, rel, depth) {
-      if (count >= 200 || depth > 6) return;
-      let names;
-      try {
-        names = fs.readdirSync(dir, { withFileTypes: true });
-      } catch (_) { return; }
-      for (const n of names) {
-        if (count >= 200) return;
-        if (n.name.startsWith('.') && n.name !== '.') {
-          if (query.startsWith('.') || query.includes(n.name.toLowerCase())) { /* still allow dotfiles when queried */ } else continue;
+    const MAX = 100;
+    try {
+      const names = fs.readdirSync(cwd, { withFileTypes: true });
+      if (query === '') {
+        // bare '@': only non-hidden immediate children, like the CLI
+        for (const n of names) {
+          if (results.length >= MAX) break;
+          if (n.name.startsWith('.')) continue;
+          results.push({ path: n.name, isDir: n.isDirectory() });
         }
-        if (n.isDirectory() && skip.has(n.name) && !query.includes(n.name.toLowerCase())) continue;
-        const relPath = rel ? rel + '/' + n.name : n.name;
-        if (query && !relPath.toLowerCase().includes(query)) {
-          if (n.isDirectory()) walk(path.join(dir, n.name), relPath, depth + 1);
-          continue;
-        }
-        results.push({ path: relPath, isDir: n.isDirectory() });
-        count++;
-        if (n.isDirectory() && depth < 6) walk(path.join(dir, n.name), relPath, depth + 1);
+        return results;
       }
-    }
-    try { walk(cwd, '', 0); } catch (_) { /* ignore */ }
-    return results.slice(0, 100);
+      const queue = [{ dir: cwd, rel: '', depth: 0 }];
+      while (queue.length && results.length < MAX) {
+        const { dir, rel, depth } = queue.shift();
+        if (depth > 5) continue;
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { continue; }
+        for (const n of entries) {
+          if (results.length >= MAX) break;
+          const rot = rel ? rel + '/' + n.name : n.name;
+          const hidden = n.name.startsWith('.');
+          if (hidden && !query.startsWith('.')) continue;
+          if (n.isDirectory() && skip.has(n.name)) continue;
+          if (rot.toLowerCase().includes(query)) {
+            results.push({ path: rot, isDir: n.isDirectory() });
+          }
+          if (n.isDirectory()) queue.push({ dir: path.join(dir, n.name), rel: rot, depth: depth + 1 });
+        }
+      }
+    } catch (_) { /* ignore */ }
+    return results.slice(0, MAX);
   });
 
   ipcMain.handle('fs:readFile', (_e, args) => {
@@ -634,6 +627,13 @@ function createWindow() {
     } catch (_) { /* ignore */ }
   });
   win.on('closed', () => { win = null; });
+  win.webContents.on('console-message', (_e, level, message) => {
+    if (level >= 2) console.log('RENDERER-ERR', level, String(message).slice(0, 300));
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.log('RENDERER-GONE', JSON.stringify(details));
+  });
+  win.webContents.on('unresponsive', () => console.log('RENDERER-UNRESPONSIVE'));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'), SMOKE ? { query: { smoke: '1' } } : undefined);
   if (process.env.VIBE_DESKTOP_DEVTOOLS === '1') win.webContents.openDevTools();
 }
@@ -714,14 +714,16 @@ async function runSmoke() {
   }
   console.log('SMOKE turn OK (PONG rendered in UI)');
 
-  // 2) approval flow with ask agent
+  // 2) approval flow with ask agent (test pins a tool-reliable model,
+  //    independent of whatever model the user currently has active)
   const start2 = await srv.request('session/start', {
     agentConfig: { cwd: tmp, terminalKey: 'vibe-desktop|smoke2', trustWorkspace: true, agent: 'ask' },
     historyLimit: 100,
+    model: 'mistral-large-4-0-3',
   });
   const sid2 = start2.state.session.id;
   applyNotification('session/snapshot', { sessionId: sid2, state: start2.state });
-  await srv.request('turn/start', { sessionId: sid2, message: [{ type: 'text', text: 'Use the shell/bash tool to run exactly: echo SMOKE_OK_123' }] });
+  await srv.request('turn/start', { sessionId: sid2, message: [{ type: 'text', text: 'Run the shell/bash tool with exactly this command: node -e "console.log(\'SMOKE_OK_123\')". You must actually call the tool — do not answer with text only.' }] });
   let callback = null;
   await waitFor(() => {
     const st = getState(sid2);

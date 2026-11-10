@@ -239,43 +239,125 @@ async function boot() {
 
   if (!SMOKE_MODE) {
     const last = S.settings.lastProject;
-    if (last && S.projects.includes(last)) selectProject(last);
+    if (last && S.projects.some((p) => normalizeCwd(p) === normalizeCwd(last))) selectProject(last);
     else if (S.projects.length) selectProject(S.projects[0]);
     else renderEmpty();
   } else {
     renderEmpty();
   }
 
+  // full state (snapshots from session open/read)
   vibe.on('vibe:state', (st2) => {
     if (st2 && st2.sessionId === S.activeSessionId) {
-      const prevModel = S.state && S.state.session && S.state.session.model;
       S.state = st2;
       renderChat();
       updateHeader();
-      const nowModel = st2.session && st2.session.model;
-      if (nowModel && nowModel !== prevModel) {
-        $('#model-select').value = nowModel;
-        loadModels();
-      } else if (st2.session && st2.session.reasoningEffort) {
-        const ts = $('#thinking-select');
-        if (Array.from(ts.options).some((o) => o.value === st2.session.reasoningEffort)) ts.value = st2.session.reasoningEffort;
-      }
+      syncModelSelects(st2.session && st2.session.model);
     }
+  });
+  // incremental updates (streaming-friendly, no full re-serialization)
+  vibe.on('vibe:entry', ({ sessionId, entry }) => {
+    if (sessionId !== S.activeSessionId || !S.state) return;
+    const i = S.state.entries.findIndex((e) => e.id === entry.id);
+    if (i >= 0) S.state.entries[i] = entry;
+    else S.state.entries.push(entry);
+    renderChat();
+    updateHeader();
+  });
+  vibe.on('vibe:session', ({ sessionId, session }) => {
+    if (sessionId !== S.activeSessionId || !S.state) return;
+    const prevModel = S.state.session && S.state.session.model;
+    S.state.session = session;
+    updateHeader();
+    syncModelSelects(session.model !== prevModel ? session.model : null);
+  });
+  vibe.on('vibe:callbacks', ({ sessionId, activeCallbacks }) => {
+    if (sessionId !== S.activeSessionId || !S.state) return;
+    S.state.activeCallbacks = activeCallbacks || [];
+    renderChat();
+  });
+  vibe.on('vibe:queue', ({ sessionId, queue }) => {
+    if (sessionId !== S.activeSessionId || !S.state) return;
+    S.state.turnQueue = queue;
+    updateHeader();
   });
   vibe.on('vibe:event', (ev) => {
     if (ev.method === 'error') showBanner('サーバーエラー: ' + pretty(ev.params, 500));
   });
   vibe.on('vibe:serverExit', () => {
     const s2 = $('#server-status');
-    s2.textContent = 'サーバーが終了しました。再接続するにはアプリを再起動してください。';
+    s2.textContent = 'サーバーが終了しました。操作をすると自動で再接続します。';
     s2.className = 'server-status err';
   });
+
+  // keep the sidebar fresh (titles/previews change as turns finish)
+  setInterval(async () => {
+    if (document.hidden) return;
+    await refreshSessions();
+    rebuildProjects();
+    renderSidebar();
+  }, 30000);
+  window.addEventListener('focus', async () => {
+    await refreshSessions();
+    rebuildProjects();
+    renderSidebar();
+  });
+}
+
+function syncModelSelects(modelAlias) {
+  if (!modelAlias) return;
+  const sel = $('#model-select');
+  if (sel.value !== modelAlias) {
+    if (!Array.from(sel.options).some((o) => o.value === modelAlias)) {
+      const opt = document.createElement('option');
+      opt.value = modelAlias;
+      opt.textContent = modelAlias;
+      sel.appendChild(opt);
+    }
+    sel.value = modelAlias;
+  }
+  const st = S.state && S.state.session;
+  const curT = st && st.reasoningEffort;
+  const ts = $('#thinking-select');
+  if (curT && Array.from(ts.options).some((o) => o.value === curT)) ts.value = curT;
 }
 
 function showBanner(msg) {
   const b = $('#banner');
   b.textContent = msg;
+  b.className = 'banner error';
   b.classList.remove('hidden');
+}
+
+let infoTimer = null;
+function showInfo(msg, ms = 6000) {
+  const b = $('#banner');
+  b.textContent = msg;
+  b.className = 'banner info';
+  b.classList.remove('hidden');
+  if (infoTimer) clearTimeout(infoTimer);
+  infoTimer = setTimeout(() => b.classList.add('hidden'), ms);
+}
+
+function errMsg(e) {
+  let m = String((e && e.message) || e || 'unknown error');
+  m = m.replace(/^Error invoking remote method\s+[^:]*:\s*/, '');
+  return m;
+}
+
+// guarded invoke: shows a banner and returns null on failure
+async function gi(label, channel, args) {
+  try {
+    return await vibe.invoke(channel, args);
+  } catch (e) {
+    showBanner(`${label}に失敗: ${errMsg(e)}`);
+    return null;
+  }
+}
+
+function normalizeCwd(p) {
+  if (!p) return '';
+  return String(p).replace(/[\\/]+$/, '').toLowerCase();
 }
 
 function fillAgentSelect() {
@@ -338,6 +420,12 @@ async function loadModels() {
       sel.appendChild(opt);
     }
     const cur = (S.state && S.state.session && S.state.session.model) || (S.activeModel && (S.activeModel.alias || S.activeModel.name)) || S.settings.model;
+    if (cur && !Array.from(sel.options).some((o) => o.value === cur)) {
+      const opt = document.createElement('option');
+      opt.value = cur;
+      opt.textContent = cur;
+      sel.appendChild(opt);
+    }
     if (cur) sel.value = cur;
     const tsel = $('#thinking-select');
     const levels = (S.activeModel && S.activeModel.thinkingLevels) || [];
@@ -361,19 +449,21 @@ async function refreshSessions() {
     S.sessions = await vibe.invoke('sessions:list', {});
   } catch (e) {
     S.sessions = [];
-    showBanner('セッション一覧の取得に失敗: ' + String(e && e.message || e));
+    showBanner('セッション一覧の取得に失敗: ' + errMsg(e));
   }
-  S.sessions.sort((a, b) => (b.bumpedAt || b.updatedAt || 0) - (a.updatedAt || 0));
+  S.sessions.sort((a, b) => ((b.bumpedAt || b.updatedAt || 0) - (a.bumpedAt || a.updatedAt || 0)));
 }
 
 function rebuildProjects() {
-  const set = new Set(S.settings.projects || []);
-  for (const s of S.sessions) if (s.cwd) set.add(s.cwd);
-  S.projects = Array.from(set);
+  const set = new Map();
+  for (const p of S.settings.projects || []) set.set(normalizeCwd(p), p);
+  for (const s of S.sessions) if (s.cwd && !set.has(normalizeCwd(s.cwd))) set.set(normalizeCwd(s.cwd), s.cwd);
+  S.projects = Array.from(set.values());
 }
 
 function sessionsFor(cwd) {
-  return S.sessions.filter((s) => s.cwd === cwd);
+  const n = normalizeCwd(cwd);
+  return S.sessions.filter((s) => normalizeCwd(s.cwd) === n);
 }
 
 // ---------------- sidebar ----------------
@@ -418,8 +508,14 @@ function renderSidebar() {
     div.querySelector('.del').onclick = async (e) => {
       e.stopPropagation();
       if (!confirm('このセッションを削除しますか？')) return;
-      await vibe.invoke('session:delete', { sessionId: s.id });
-      if (S.activeSessionId === s.id) { S.activeSessionId = null; S.state = null; renderChat(); }
+      const res = await gi('セッションの削除', 'session:delete', { sessionId: s.id });
+      if (!res) return;
+      if (S.activeSessionId === s.id) {
+        S.activeSessionId = null;
+        S._renderedSessionId = null;
+        S.state = null;
+        renderChat();
+      }
       await refreshSessions();
       renderSidebar();
     };
@@ -428,16 +524,18 @@ function renderSidebar() {
 }
 
 async function selectProject(cwd) {
+  if (!cwd) return;
   S.activeCwd = cwd;
   S.settings.lastProject = cwd;
   await vibe.invoke('settings:save', S.settings);
-  if (!S.sessions.some((s) => s.cwd === cwd)) await refreshSessions();
+  if (!S.sessions.some((s) => normalizeCwd(s.cwd) === normalizeCwd(cwd))) await refreshSessions();
   renderSidebar();
   const list = sessionsFor(cwd);
   if (list.length) {
     await resumeSession(list[0].id);
   } else {
     S.activeSessionId = null;
+    S._renderedSessionId = null;
     S.state = null;
     renderEmpty();
     updateHeader();
@@ -448,30 +546,41 @@ async function selectProject(cwd) {
 
 async function startNewChat() {
   if (!S.activeCwd) { showBanner('先にプロジェクト（フォルダ）を選んでください'); return; }
-  const res = await vibe.invoke('session:start', {
+  const res = await gi('新規チャットの開始', 'session:start', {
     cwd: S.activeCwd,
     agent: $('#agent-select').value || null,
     autoApprove: $('#auto-approve').checked,
     model: $('#model-select').value || S.settings.model || null,
     thinking: $('#thinking-select').value || null,
   });
+  if (!res || !res.sessionId) return;
   S.activeSessionId = res.sessionId;
+  S._renderedSessionId = null;
   S.state = res.state;
   await loadModels();
-  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } }).catch(() => {});
   await refreshSessions();
   renderSidebar();
   renderChat();
   updateHeader();
+  S._forceScroll = true;
   composerEl.focus();
 }
 
 async function resumeSession(sessionId) {
-  const res = await vibe.invoke('session:resume', { sessionId, cwd: S.activeCwd });
+  let res = await gi('セッションを開く', 'session:resume', { sessionId, cwd: S.activeCwd });
+  if (!res || !res.state || !res.state.session) {
+    // resume was refused (e.g. the session is open elsewhere): fall back to read-only
+    const ro = await gi('セッションの読み込み', 'session:read', { sessionId, historyLimit: 500 });
+    if (!ro || !ro.session) return;
+    res = { sessionId: ro.sessionId || sessionId, state: ro };
+    showInfo('切り替えできませんでした。読み取り専用で開いています（別ターミナル等で使用中の可能性があります)。');
+  }
   S.activeSessionId = res.sessionId || sessionId;
+  S._renderedSessionId = null;
   S.state = res.state;
   await loadModels();
-  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } }).catch(() => {});
   await refreshSessions();
   renderSidebar();
   renderChat();
@@ -480,17 +589,19 @@ async function resumeSession(sessionId) {
 
 async function continueLast() {
   if (!S.activeCwd) return;
-  const res = await vibe.invoke('session:continue', {
+  const res = await gi('セッションの続き', 'session:continue', {
     cwd: S.activeCwd,
     agent: $('#agent-select').value || null,
     autoApprove: $('#auto-approve').checked,
     model: $('#model-select').value || S.settings.model || null,
     thinking: $('#thinking-select').value || null,
   });
+  if (!res || !res.sessionId) return;
   S.activeSessionId = res.sessionId;
+  S._renderedSessionId = null;
   S.state = res.state;
   await loadModels();
-  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } }).catch(() => {});
   await refreshSessions();
   renderSidebar();
   renderChat();
@@ -588,7 +699,12 @@ function renderChat() {
       S.nodeCache.delete(id);
     }
   }
-  chatEl.scrollTop = chatEl.scrollHeight;
+  // auto-scroll only when already near the bottom (don't yank the user while reading)
+  const nearBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 160;
+  if (nearBottom || S._forceScroll) {
+    chatEl.scrollTop = chatEl.scrollHeight;
+    S._forceScroll = false;
+  }
 }
 
 function renderEntry(e, sessionId) {
@@ -815,11 +931,14 @@ function renderCallback(e, sessionId) {
       b.className = 'btn' + (choice === 'deny' || choice === 'cancel_turn' ? ' btn-danger' : ' btn-primary');
       b.textContent = APPROVAL_LABELS[choice] || choice;
       b.onclick = async () => {
-        await vibe.invoke('callback:answer', {
+        b.disabled = true;
+        box.querySelectorAll('.approval-buttons .btn').forEach((x) => { x.disabled = true; });
+        const res = await gi('承認の送信', 'callback:answer', {
           sessionId,
           callbackId: e.callbackId,
           output: { type: 'approval', decision: { type: choice } },
         });
+        if (!res) box.querySelectorAll('.approval-buttons .btn').forEach((x) => { x.disabled = false; });
       };
       btns.appendChild(b);
     }
@@ -868,21 +987,25 @@ function renderCallback(e, sessionId) {
     ok.className = 'btn btn-primary';
     ok.textContent = '回答する';
     ok.onclick = async () => {
-      await vibe.invoke('callback:answer', {
+      ok.disabled = true;
+      const res = await gi('回答の送信', 'callback:answer', {
         sessionId,
         callbackId: e.callbackId,
         output: { type: 'user_input', result: { answers: answers.map((a) => ({ question: a.question, answer: a.input.value })), cancelled: false } },
       });
+      if (!res) ok.disabled = false;
     };
     const cancel = document.createElement('button');
     cancel.className = 'btn btn-danger';
     cancel.textContent = 'キャンセル';
     cancel.onclick = async () => {
-      await vibe.invoke('callback:answer', {
+      cancel.disabled = true;
+      const res = await gi('キャンセル', 'callback:answer', {
         sessionId,
         callbackId: e.callbackId,
         output: { type: 'user_input', result: { answers: [], cancelled: true } },
       });
+      if (!res) cancel.disabled = false;
     };
     btns.appendChild(ok); btns.appendChild(cancel);
     box.appendChild(btns);
@@ -912,13 +1035,18 @@ function updateHeader() {
   const titleEl = $('#session-title');
   const cwdEl = $('#session-cwd');
   const badge = $('#status-badge');
-  const ctx = $('#ctx-chip');
   const btnInt = $('#btn-interrupt');
+  const setBadge = (running, queuedCount) => {
+    const label = badge.querySelector('.label');
+    const text = running ? (queuedCount ? `実行中 (+${queuedCount})` : '実行中') : '待機中';
+    if (label) label.textContent = text;
+    else badge.appendChild(Object.assign(document.createElement('span'), { className: 'label', textContent: text }));
+    badge.className = 'status-badge ' + (running ? 'running' : 'idle');
+  };
   if (!st || !st.session) {
     titleEl.textContent = '新しいチャット';
     cwdEl.textContent = S.activeCwd || '';
-    badge.textContent = 'idle';
-    badge.className = 'status-badge idle';
+    setBadge(false, 0);
     renderHeaderChips();
     btnInt.classList.add('hidden');
     return;
@@ -928,10 +1056,8 @@ function updateHeader() {
   titleEl.title = 'クリックで編集 — ' + (s.cwd || '');
   cwdEl.textContent = s.cwd || S.activeCwd || '';
   const running = s.status && s.status.type === 'running';
-  const label = badge.querySelector('.label');
-  if (label) label.textContent = running ? '実行中' : '待機中';
-  else badge.textContent = running ? '実行中…' : '待機中';
-  badge.className = 'status-badge ' + (running ? 'running' : 'idle');
+  const queuedCount = (st.turnQueue && st.turnQueue.items && st.turnQueue.items.length) || 0;
+  setBadge(running, queuedCount);
   renderHeaderChips();
   btnInt.classList.toggle('hidden', !running);
 }
@@ -945,17 +1071,24 @@ async function send() {
   if (!text && !images.length) return;
   if (!S.activeSessionId) { showBanner('先にセッションを開いてください'); return; }
   S.sending = true;
+  let ok = false;
+  let queued = false;
   try {
-    await vibe.invoke('turn:send', { sessionId: S.activeSessionId, text, images });
+    const res = await vibe.invoke('turn:send', { sessionId: S.activeSessionId, text, images });
+    ok = true;
+    queued = !!(res && res.queued);
   } catch (e) {
-    showBanner('送信に失敗: ' + String(e && e.message || e));
+    showBanner('送信に失敗: ' + errMsg(e));
   } finally {
     S.sending = false;
   }
+  if (!ok) return; // keep the draft so nothing is lost
+  if (queued) showInfo('回答中のため、送信待機に入りました（順番に処理されます)。');
   composerEl.value = '';
   autoGrow();
   S.attachments = [];
   renderAttachments();
+  S._forceScroll = true;
   composerEl.focus();
 }
 
@@ -1087,14 +1220,33 @@ composerEl.addEventListener('paste', (e) => {
 
 $('#session-title').onclick = async () => {
   if (!S.activeSessionId) return;
+  const titleEl = $('#session-title');
+  if (titleEl.querySelector('input')) return; // already editing
   const cur = S.state && S.state.session ? (S.state.session.title || '') : '';
-  const t = prompt('セッションタイトルを入力:', cur);
-  if (t == null) return;
-  try {
-    await vibe.invoke('session:rename', { sessionId: S.activeSessionId, title: t });
+  const input = document.createElement('input');
+  input.className = 'select select-chip';
+  input.value = cur;
+  titleEl.textContent = '';
+  titleEl.appendChild(input);
+  input.focus();
+  input.select();
+  const done = async (commit) => {
+    const newTitle = input.value.trim();
+    titleEl.textContent = '';
+    updateHeader();
+    if (!commit || newTitle === cur) return;
+    const res = await gi('タイトルの変更', 'session:rename', { sessionId: S.activeSessionId, title: newTitle });
+    if (!res) return;
+    await vibe.invoke('session:read', { sessionId: S.activeSessionId, historyLimit: 10 }).catch(() => {});
     await refreshSessions();
     renderSidebar();
-  } catch (_) { /* ignore */ }
+    updateHeader();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(true); }
+    else if (e.key === 'Escape') { e.stopPropagation(); done(false); }
+  });
+  input.addEventListener('blur', () => done(true));
 };
 
 document.addEventListener('click', (e) => {
@@ -1136,10 +1288,10 @@ window.__snapshot = () => ({
   composer: composerEl.value,
   chatTextHead: chatEl.innerText.slice(0, 500),
   account: S.account,
-  notifyOnComplete: S.settings.notifyOnComplete,
-  notifySound: S.settings.notifySound,
-  soundPreset: S.settings.soundPreset,
-  soundFile: S.settings.soundFile,
+  notifyOnComplete: S.settings ? S.settings.notifyOnComplete : undefined,
+  notifySound: S.settings ? S.settings.notifySound : undefined,
+  soundPreset: S.settings ? S.settings.soundPreset : undefined,
+  soundFile: S.settings ? S.settings.soundFile : undefined,
 });
 
 boot().then(() => { window.__ready = true; });
