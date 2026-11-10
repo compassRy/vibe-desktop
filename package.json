@@ -1,0 +1,41 @@
+{
+  "name": "vibe-desktop",
+  "version": "0.1.0",
+  "description": "Mistral Vibe のデスクトップアプリ（vibe-app-server JSON-RPC クライアント）",
+  "main": "main.js",
+  "license": "MIT",
+  "author": "dyuus",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win portable"
+  },
+  "dependencies": {
+    "marked": "^18.2.0"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "ai.mistral.vibe.desktop",
+    "productName": "Vibe Desktop",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json",
+      "node_modules/marked/**/*"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "assets/icon.ico"
+    }
+  }
+}

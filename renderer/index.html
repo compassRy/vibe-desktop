@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+<title>Vibe Desktop</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <div class="logo">
+        <svg viewBox="0 0 32 32" width="18" height="18" aria-hidden="true"><path d="M4 5 L12 27 L16 17 L20 27 L28 5" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="logo-text">Vibe Desktop</div>
+      <div class="spacer"></div>
+      <button id="theme-toggle" class="icon-btn" title="テーマ切替 (ダーク / ライト / システム)">
+        <svg class="ico-moon" viewBox="0 0 24 24" width="15" height="15"><path d="M20 13.5A8 8 0 1 1 10.5 4 6.5 6.5 0 0 0 20 13.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+        <svg class="ico-sun" viewBox="0 0 24 24" width="15" height="15"><circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <svg class="ico-auto" viewBox="0 0 24 24" width="15" height="15"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17Z" fill="currentColor"/></svg>
+      </button>
+    </div>
+    <div id="server-status" class="server-status"><span class="dot"></span>接続中…</div>
+    <div class="side-section">
+      <div class="side-title">プロジェクト</div>
+      <div id="project-list" class="project-list"></div>
+      <button id="btn-open-folder" class="btn btn-ghost btn-block">＋ フォルダを開く</button>
+    </div>
+    <div class="side-section grow">
+      <div class="side-title row">
+        <span>セッション</span>
+        <span class="spacer"></span>
+        <button id="btn-new-chat" class="btn btn-small" title="新しいチャット">新規</button>
+        <button id="btn-continue" class="btn btn-small" title="このフォルダの続きから">続き</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+    </div>
+    <div class="side-section side-footer">
+      <div class="side-title">エージェント</div>
+      <select id="agent-select" class="select"></select>
+      <label class="check"><input type="checkbox" id="auto-approve" /> 自動承認（YOLO）</label>
+    </div>
+  </aside>
+  <main id="main">
+    <header id="chat-header">
+      <div class="title-block">
+        <div id="session-title" class="session-title" title="クリックで編集">新しいチャット</div>
+        <div id="session-cwd" class="session-cwd"></div>
+      </div>
+      <div class="spacer"></div>
+      <select id="model-select" class="select select-chip" title="モデル切り替え"></select>
+      <select id="thinking-select" class="select select-chip" title="思考レベル"></select>
+      <div id="status-badge" class="status-badge"><span class="pulse"></span><span class="label">待機中</span></div>
+      <div id="ctx-usage" class="ctx-usage"></div>
+      <button id="btn-interrupt" class="btn btn-small btn-danger hidden">割り込み</button>
+    </header>
+    <div id="banner" class="banner hidden"></div>
+    <div id="chat" class="chat"></div>
+    <div id="composer-wrap">
+      <div id="attach-bar" class="attach-bar hidden"></div>
+      <div id="mention-popup" class="mention-popup hidden"></div>
+      <div class="composer">
+        <div class="composer-box">
+          <textarea id="composer" rows="1" placeholder="メッセージを入力… (@ でファイル参照、Enter で送信、Shift+Enter で改行)"></textarea>
+          <button id="btn-send" class="send-btn" title="送信 (Enter)">
+            <svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 12h13M12 5l7 7-7 7" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div class="composer-hint">@ でファイルメンション ／ 画像貼り付け可</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="vendor/marked.umd.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
