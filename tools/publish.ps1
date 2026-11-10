@@ -1,5 +1,7 @@
 # Creates the GitHub repo (if needed) and pushes this folder.
+# Usage: powershell -File tools/publish.ps1 [-Message "commit message"]
 # Uses the Windows-stored git credential in memory only; never prints the secret.
+param([string]$Message = 'Update vibe-desktop')
 $ErrorActionPreference = 'Continue'
 $git = 'C:\Program Files\Git\cmd\git.exe'
 $root = Split-Path -Parent $PSScriptRoot
@@ -43,15 +45,7 @@ Set-Location $root
 & $git config user.name $owner
 & $git config user.email "$owner@users.noreply.github.com"
 & $git add -A
-& $git commit -m "Vibe Desktop v0.1.0 — Electron GUI for Mistral Vibe (vibe-app-server JSON-RPC)
-
-- chat UI with markdown, tool-call cards, approval dialogs
-- model/thinking switcher, agent selector, YOLO toggle
-- project/session sidebar with resume/continue
-- local file editing in the opened folder
-- localhost automation HTTP API (tools/gui.js)
-- dark/light/system themes
-- README with usage and protocol notes" | Out-Null
+& $git commit -m $Message | Out-Null
 $remote = "https://github.com/$owner/$repoName.git"
 & $git remote remove origin 2>$null
 & $git remote add origin $remote 2>$null
