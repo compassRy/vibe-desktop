@@ -1,6 +1,6 @@
 # Creates the GitHub repo (if needed) and pushes this folder.
 # Uses the Windows-stored git credential in memory only; never prints the secret.
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 $git = 'C:\Program Files\Git\cmd\git.exe'
 $root = Split-Path -Parent $PSScriptRoot
 $repoName = 'vibe-desktop'
@@ -53,8 +53,9 @@ Set-Location $root
 - dark/light/system themes
 - README with usage and protocol notes" | Out-Null
 $remote = "https://github.com/$owner/$repoName.git"
-& $git remote remove origin 2>$null | Out-Null
-& $git remote add origin $remote
+& $git remote remove origin 2>$null
+& $git remote add origin $remote 2>$null
+if ((& $git remote) -notcontains 'origin') { & $git remote add origin $remote }
 $env:GIT_TERMINAL_PROMPT = '0'
 & $git push -u origin main 2>&1 | ForEach-Object { Write-Output $_ }
 Write-Output "PUSH_DONE"
