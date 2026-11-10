@@ -21,7 +21,102 @@ const S = {
   sending: false,
   mention: null, // {tokenStart, token, items, sel}
   nodeCache: new Map(), // entryId -> {key, el}  (render cache to stay light)
+  account: null, // {plan, budget:{usage_percentage, reset_at, payg_enabled}, ...}
 };
+
+const SYSTEM_SOUNDS = {
+  notify: 'C:/Windows/Media/notify.wav',
+  chime: 'C:/Windows/Media/chimes.wav',
+  ding: 'C:/Windows/Media/ding.wav',
+  chord: 'C:/Windows/Media/chord.wav',
+};
+
+function playNotifySound() {
+  if (!S.settings || !S.settings.notifySound) return;
+  let src = null;
+  if (S.settings.soundFile) {
+    src = 'file:///' + S.settings.soundFile.replace(/\\/g, '/');
+  } else if (S.settings.soundPreset && SYSTEM_SOUNDS[S.settings.soundPreset]) {
+    src = 'file:///' + SYSTEM_SOUNDS[S.settings.soundPreset];
+  }
+  if (!src) return; // 'default' = toast の標準音のみ
+  try {
+    const a = new Audio(src);
+    a.play().catch(() => {});
+  } catch (_) { /* ignore */ }
+}
+
+function wireNotificationSettings() {
+  const nt = $('#notify-toggle');
+  const st = $('#sound-toggle');
+  const ss = $('#sound-select');
+  const pick = $('#btn-pick-sound');
+  nt.checked = S.settings.notifyOnComplete !== false;
+  st.checked = S.settings.notifySound !== false;
+  ss.value = S.settings.soundFile ? 'custom' : (S.settings.soundPreset || 'default');
+  pick.classList.toggle('hidden', ss.value !== 'custom');
+  nt.onchange = async () => { S.settings.notifyOnComplete = nt.checked; await vibe.invoke('settings:save', S.settings); };
+  st.onchange = async () => { S.settings.notifySound = st.checked; await vibe.invoke('settings:save', S.settings); };
+  ss.onchange = async () => {
+    if (ss.value === 'custom') {
+      S.settings.soundPreset = 'custom';
+      pick.classList.remove('hidden');
+      if (!S.settings.soundFile) {
+        const f = await vibe.invoke('file:pick', { filterName: '音声ファイル', extensions: ['wav', 'mp3', 'ogg', 'm4a'] });
+        if (f) S.settings.soundFile = f;
+      }
+    } else {
+      S.settings.soundPreset = ss.value;
+      S.settings.soundFile = null;
+      pick.classList.add('hidden');
+    }
+    await vibe.invoke('settings:save', S.settings);
+  };
+  pick.onclick = async () => {
+    const f = await vibe.invoke('file:pick', { filterName: '音声ファイル', extensions: ['wav', 'mp3', 'ogg', 'm4a'] });
+    if (f) {
+      S.settings.soundFile = f;
+      S.settings.soundPreset = 'custom';
+      ss.value = 'custom';
+      await vibe.invoke('settings:save', S.settings);
+      playNotifySound(); //試聴
+    }
+  };
+}
+
+function renderHeaderChips() {
+  // usage (残り使用量)
+  const uc = $('#usage-chip');
+  const b = S.account && S.account.budget;
+  if (b && typeof b.usagePercentage === 'number') {
+    const pct = Math.min(100, Math.round(b.usagePercentage));
+    uc.innerHTML = `使用量 ${pct}%<span class="mini-bar"><span style="width:${pct}%"></span></span>`;
+    uc.className = 'chip' + (pct >= 90 ? ' danger' : pct >= 75 ? ' warn' : '');
+    const reset = b.resetAt ? new Date(b.resetAt).toLocaleDateString() : '';
+    uc.title = `今月の使用量 ${pct}%（残り ${100 - pct}%）${reset ? '／リセット: ' + reset : ''}${b.paygEnabled ? '／PAYG' : ''}`;
+  } else {
+    uc.textContent = '使用量 --';
+    uc.className = 'chip';
+    uc.title = '使用量を取得できませんでした（APIキーのプランで非対応の可能性があります)';
+  }
+  // context
+  const cc = $('#ctx-chip');
+  const cu = S.state && S.state.session && S.state.session.contextUsage;
+  const total = cu && cu.totalTokens;
+  const winSize = (S.activeModel && (S.activeModel.autoCompactThreshold || S.activeModel.maxContextLength)) || 200000;
+  if (total) {
+    const pct = Math.min(100, Math.round((total / winSize) * 100));
+    $('#ctx-label').textContent = `ctx ${fmtNum(total)}/${fmtNum(winSize)}`;
+    $('#ctx-fill').style.width = pct + '%';
+    cc.className = 'chip' + (pct >= 90 ? ' danger' : pct >= 75 ? ' warn' : '');
+    cc.title = `コンテキスト使用量 ${total.toLocaleString()} / ${winSize.toLocaleString()} トークン (${pct}%)`;
+  } else {
+    $('#ctx-label').textContent = 'ctx --';
+    $('#ctx-fill').style.width = '0%';
+    cc.className = 'chip';
+    cc.title = 'コンテキスト使用量（モデル呼び出し後に表示されます)';
+  }
+}
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -132,7 +227,11 @@ async function boot() {
   fillAgentSelect();
   $('#auto-approve').checked = !!S.settings.autoApprove;
   wireModelSelectors();
+  wireNotificationSettings();
+  vibe.on('vibe:account', (a) => { S.account = a; renderHeaderChips(); });
+  vibe.on('vibe:turn-completed', () => playNotifySound());
   await loadModels();
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
 
   await refreshSessions();
   rebuildProjects();
@@ -212,6 +311,7 @@ function wireModelSelectors() {
         await vibe.invoke('model:set', { sessionId: S.activeSessionId, alias, thinking: $('#thinking-select').value || null });
         await vibe.invoke('session:read', { sessionId: S.activeSessionId, historyLimit: 10 });
         await loadModels();
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
       } catch (e) { showBanner('モデル変更に失敗: ' + String(e && e.message || e)); }
     }
   };
@@ -358,6 +458,7 @@ async function startNewChat() {
   S.activeSessionId = res.sessionId;
   S.state = res.state;
   await loadModels();
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
   await refreshSessions();
   renderSidebar();
   renderChat();
@@ -370,6 +471,7 @@ async function resumeSession(sessionId) {
   S.activeSessionId = res.sessionId || sessionId;
   S.state = res.state;
   await loadModels();
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
   await refreshSessions();
   renderSidebar();
   renderChat();
@@ -388,6 +490,7 @@ async function continueLast() {
   S.activeSessionId = res.sessionId;
   S.state = res.state;
   await loadModels();
+  vibe.invoke('account:read').then((a) => { if (a) { S.account = a; renderHeaderChips(); } });
   await refreshSessions();
   renderSidebar();
   renderChat();
@@ -809,14 +912,14 @@ function updateHeader() {
   const titleEl = $('#session-title');
   const cwdEl = $('#session-cwd');
   const badge = $('#status-badge');
-  const ctx = $('#ctx-usage');
+  const ctx = $('#ctx-chip');
   const btnInt = $('#btn-interrupt');
   if (!st || !st.session) {
     titleEl.textContent = '新しいチャット';
     cwdEl.textContent = S.activeCwd || '';
     badge.textContent = 'idle';
     badge.className = 'status-badge idle';
-    ctx.textContent = '';
+    renderHeaderChips();
     btnInt.classList.add('hidden');
     return;
   }
@@ -829,8 +932,7 @@ function updateHeader() {
   if (label) label.textContent = running ? '実行中' : '待機中';
   else badge.textContent = running ? '実行中…' : '待機中';
   badge.className = 'status-badge ' + (running ? 'running' : 'idle');
-  const cu = s.contextUsage;
-  ctx.textContent = cu && cu.totalTokens ? `ctx ${fmtNum(cu.totalTokens)} tok` : '';
+  renderHeaderChips();
   btnInt.classList.toggle('hidden', !running);
 }
 
@@ -1033,6 +1135,11 @@ window.__snapshot = () => ({
   activeCallbacks: S.state ? (S.state.activeCallbacks || []).map((c) => ({ callbackId: c.callbackId, title: c.title, kind: c.detail && c.detail.kind, status: c.state && c.state.status })) : [],
   composer: composerEl.value,
   chatTextHead: chatEl.innerText.slice(0, 500),
+  account: S.account,
+  notifyOnComplete: S.settings.notifyOnComplete,
+  notifySound: S.settings.notifySound,
+  soundPreset: S.settings.soundPreset,
+  soundFile: S.settings.soundFile,
 });
 
 boot().then(() => { window.__ready = true; });

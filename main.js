@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -9,6 +9,8 @@ const { startAutomationServer } = require('./src/automation');
 
 // keep memory footprint small
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384');
+// needed for Windows toast notifications
+app.setAppUserModelId('ai.mistral.vibe.desktop');
 
 const SMOKE = process.argv.includes('--smoke');
 let automation = null;
@@ -24,11 +26,17 @@ function settingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');
 }
 
+const SETTINGS_DEFAULTS = {
+  projects: [], lastProject: null, agent: null, autoApprove: false, windowBounds: null,
+  theme: 'dark', model: null,
+  notifyOnComplete: true, notifySound: true, soundPreset: 'default', soundFile: null,
+};
+
 function loadSettings() {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
+    return { ...SETTINGS_DEFAULTS, ...JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) };
   } catch (_) {
-    return { projects: [], lastProject: null, agent: null, autoApprove: false, windowBounds: null };
+    return { ...SETTINGS_DEFAULTS };
   }
 }
 
@@ -40,6 +48,55 @@ function saveSettings(s) {
 
 function terminalKeyFor(cwd) {
   return `vibe-desktop|${cwd}`;
+}
+
+// ---------- Windows toast notification on turn completion ----------
+
+function maybeNotifyTurnCompleted(sessionId, turn) {
+  try {
+    const settings = loadSettings();
+    if (!settings.notifyOnComplete) return;
+    const st = getState(sessionId);
+    if (!st || !st.session) return;
+    const title = st.session.title || st.session.preview || 'Vibe Desktop';
+    const lastAssistant = st.order
+      .map((id) => st.entries.get(id))
+      .filter((e) => e && e.type === 'message' && e.role === 'assistant')
+      .pop();
+    const body = lastAssistant
+      ? (lastAssistant.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(' ').slice(0, 160)
+      : 'ターンが完了しました';
+    const note = new Notification({ title: 'Vibe Desktop — ' + title, body });
+    note.on('click', () => {
+      if (win && !win.isDestroyed()) { win.show(); win.focus(); }
+    });
+    note.show();
+    console.log('NOTIFY sent:', title, '|', body.slice(0, 60));
+    broadcast('vibe:turn-completed', { sessionId, turnId: turn.id, title, body });
+  } catch (_) { /* notification is best-effort */ }
+}
+
+// ---------- usage / billing (残り使用量) ----------
+
+let accountTimer = null;
+function refreshAccountSoon() {
+  if (accountTimer) return;
+  accountTimer = setTimeout(async () => {
+    accountTimer = null;
+    await refreshAccount();
+  }, 1500);
+}
+
+async function refreshAccount() {
+  try {
+    const srv = await ensureServer();
+    const anySession = Array.from(sessionStates.keys())[0];
+    const res = await srv.request('account/read', { sessionId: anySession || null });
+    if (res && res.account) broadcast('vibe:account', res.account);
+    return res && res.account;
+  } catch (_) {
+    return null;
+  }
 }
 
 function broadcast(channel, payload) {
@@ -86,6 +143,28 @@ function serializeState(sessionId) {
 function pushState(sessionId) {
   const s = serializeState(sessionId);
   if (s) broadcast('vibe:state', s);
+}
+
+function applyJsonPatch(obj, ops) {
+  for (const op of ops || []) {
+    const segs = String(op.path || '').split('/').filter((s) => s !== '')
+      .map((s) => s.replace(/~1/g, '/').replace(/~0/g, '~'));
+    if (!segs.length) continue;
+    let target = obj;
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (target == null) break;
+      target = target[segs[i]];
+    }
+    if (target == null) continue;
+    const key = segs[segs.length - 1];
+    if (op.op === 'remove') {
+      if (Array.isArray(target)) target.splice(Number(key), 1);
+      else delete target[key];
+    } else {
+      target[key] = op.value; // add / replace
+    }
+  }
+  return obj;
 }
 
 function applyNotification(method, params) {
@@ -138,9 +217,13 @@ function applyNotification(method, params) {
       break;
     }
     case 'session/updated': {
-      if (!sessionId || !params.session) break;
+      if (!sessionId) break;
       const s = ensureState(sessionId);
-      s.session = params.session;
+      if (params.session) {
+        s.session = params.session;
+      } else if (s.session && params.patch) {
+        applyJsonPatch(s.session, params.patch);
+      }
       pushState(sessionId);
       break;
     }
@@ -153,6 +236,10 @@ function applyNotification(method, params) {
         s.session = { ...s.session, status: { type: 'idle' } };
       }
       pushState(sessionId);
+      if (method === 'turn/completed' && params.turn.status === 'completed') {
+        maybeNotifyTurnCompleted(sessionId, params.turn);
+        refreshAccountSoon();
+      }
       break;
     }
     case 'turn/queueUpdated': {
@@ -202,6 +289,8 @@ function startEventPoll() {
       }
     } catch (_) { /* server may be busy/restarting */ }
   }, 4000);
+  // usage/billing gauge refresh every 60s
+  setInterval(() => { refreshAccount(); }, 60000);
 }
 
 async function ensureServer() {
@@ -453,6 +542,16 @@ function registerIpc() {
     });
   });
 
+  ipcMain.handle('account:read', async () => refreshAccount());
+
+  ipcMain.handle('file:pick', async (_e, args) => {
+    const r = await dialog.showOpenDialog(win, {
+      properties: ['openFile'],
+      filters: [{ name: (args && args.filterName) || 'すべてのファイル', extensions: (args && args.extensions) || ['*'] }],
+    });
+    return r.canceled ? null : (r.filePaths[0] || null);
+  });
+
   ipcMain.handle('events:read', async (_e, args) => {
     const srv = await ensureServer();
     const params = { afterEventId: args.afterEventId ?? null, batchSize: args.batchSize || 500 };
@@ -523,6 +622,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      autoplayPolicy: 'no-user-gesture-required',
     },
   });
   win.on('close', () => {

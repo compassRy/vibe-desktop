@@ -2,7 +2,7 @@
 <html lang="ja" data-theme="dark">
 <head>
 <meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self' file: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
 <title>Vibe Desktop</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
@@ -41,6 +41,20 @@
       <select id="agent-select" class="select"></select>
       <label class="check"><input type="checkbox" id="auto-approve" /> 自動承認（YOLO）</label>
     </div>
+    <div class="side-section side-footer">
+      <div class="side-title">通知</div>
+      <label class="check"><input type="checkbox" id="notify-toggle" /> 回答完了をWindows通知</label>
+      <label class="check"><input type="checkbox" id="sound-toggle" /> 音を鳴らす</label>
+      <select id="sound-select" class="select">
+        <option value="default">システム標準音</option>
+        <option value="notify">notify.wav</option>
+        <option value="chime">chimes.wav</option>
+        <option value="ding">ding.wav</option>
+        <option value="chord">chord.wav</option>
+        <option value="custom">カスタムファイル…</option>
+      </select>
+      <button id="btn-pick-sound" class="btn btn-ghost btn-block hidden">音声ファイルを選択</button>
+    </div>
   </aside>
   <main id="main">
     <header id="chat-header">
@@ -52,7 +66,8 @@
       <select id="model-select" class="select select-chip" title="モデル切り替え"></select>
       <select id="thinking-select" class="select select-chip" title="思考レベル"></select>
       <div id="status-badge" class="status-badge"><span class="pulse"></span><span class="label">待機中</span></div>
-      <div id="ctx-usage" class="ctx-usage"></div>
+      <div id="usage-chip" class="chip" title="今月の使用量">使用量 --</div>
+      <div id="ctx-chip" class="chip" title="コンテキスト使用量"><span id="ctx-label">ctx --</span><span class="mini-bar"><span id="ctx-fill"></span></span></div>
       <button id="btn-interrupt" class="btn btn-small btn-danger hidden">割り込み</button>
     </header>
     <div id="banner" class="banner hidden"></div>
